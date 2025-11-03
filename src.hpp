@@ -54,17 +54,18 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     }
 
     // logits = Q * K^T  => shape: (i+1) x (i+1) in SRAM
-    Matrix *logits = matrix_memory_allocator.Allocate("logits");
-    gpu_sim.MatMul(Q, K_T_acc, logits);
+    // Compute per-row scores on-the-fly to reduce peak memory
 
     // Build answer row-by-row: for each row, softmax then multiply with V_stack
     Matrix *answer = nullptr;
     for (size_t row_idx = 0; row_idx <= i; ++row_idx) {
-      Matrix *row = matrix_memory_allocator.Allocate("logits_row");
-      gpu_sim.GetRow(logits, row_idx, row, kInSharedMemory);
+      Matrix *q_row = matrix_memory_allocator.Allocate("q_row");
+      gpu_sim.GetRow(Q, row_idx, q_row, kInSharedMemory);
+      Matrix *scores_row = matrix_memory_allocator.Allocate("scores_row");
+      gpu_sim.MatMul(q_row, K_T_acc, scores_row);
 
       Matrix *row_exp = matrix_memory_allocator.Allocate("row_exp");
-      gpu_sim.MatExp(row, row_exp);
+      gpu_sim.MatExp(scores_row, row_exp);
 
       Matrix *row_sum = matrix_memory_allocator.Allocate("row_sum");
       gpu_sim.Sum(row_exp, row_sum);
@@ -88,7 +89,8 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       }
 
       // Release per-row temporaries to save SRAM
-      gpu_sim.ReleaseMatrix(row);
+      gpu_sim.ReleaseMatrix(q_row);
+      gpu_sim.ReleaseMatrix(scores_row);
       gpu_sim.ReleaseMatrix(row_exp);
       gpu_sim.ReleaseMatrix(row_sum);
       gpu_sim.ReleaseMatrix(row_soft);
@@ -99,7 +101,6 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     gpu_sim.MoveMatrixToGpuHbm(answer);
 
     // Release intermediates for this round
-    gpu_sim.ReleaseMatrix(logits);
 
     // Execute and commit
     gpu_sim.Run(false, &matrix_memory_allocator);
