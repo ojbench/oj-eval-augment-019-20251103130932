@@ -10,6 +10,8 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
   Matrix *K_T_acc = nullptr;   // d x (i+1)
   Matrix *V_stack_acc = nullptr; // (i+1) x d
 
+  const size_t d = keys.empty() ? 0 : keys[0]->GetColumnNum();
+
   for (size_t i = 0; i < keys.size(); ++i) {
     Matrix *Q = rater.GetNextQuery();
 
@@ -23,7 +25,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.MoveMatrixToSharedMem(keys[0]);
       Matrix *k0_copy = matrix_memory_allocator.Allocate("k_copy_init");
       gpu_sim.Copy(keys[0], k0_copy, kInSharedMemory);
-      gpu_sim.Transpose(k0_copy, kInSharedMemory);
+      gpu_sim.Reshape(k0_copy, d);
       K_T_acc = k0_copy;
       // Initialize V_stack_acc from values[0]
       gpu_sim.MoveMatrixToSharedMem(values[0]);
@@ -35,7 +37,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.MoveMatrixToSharedMem(keys[i]);
       Matrix *k_copy = matrix_memory_allocator.Allocate("k_copy");
       gpu_sim.Copy(keys[i], k_copy, kInSharedMemory);
-      gpu_sim.Transpose(k_copy, kInSharedMemory);
+      gpu_sim.Reshape(k_copy, d);
       Matrix *K_T_next = matrix_memory_allocator.Allocate("K_T_next");
       gpu_sim.Concat(K_T_acc, k_copy, K_T_next, /*axis=*/1, kInSharedMemory);
       gpu_sim.ReleaseMatrix(K_T_acc);
