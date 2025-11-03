@@ -6,41 +6,56 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
                Rater &rater, GpuSimulator &gpu_sim,
                MatrixMemoryAllocator matrix_memory_allocator) {
   assert(keys.size() == values.size());
+  // Accumulate across rounds to avoid rebuilding from scratch
+  Matrix *K_T_acc = nullptr;   // d x (i+1)
+  Matrix *V_stack_acc = nullptr; // (i+1) x d
+
   for (size_t i = 0; i < keys.size(); ++i) {
     Matrix *Q = rater.GetNextQuery();
 
     // Move required matrices to Shared Memory (SRAM)
     gpu_sim.MoveMatrixToSharedMem(Q);
-    for (size_t k = 0; k <= i; ++k) {
-      gpu_sim.MoveMatrixToSharedMem(keys[k]);
-      gpu_sim.MoveMatrixToSharedMem(values[k]);
-    }
 
-    // Build K_stack (i+1 x d) in SRAM by vertical concatenation of keys[0..i]
-    Matrix *K_stack = matrix_memory_allocator.Allocate("K_stack_0");
-    gpu_sim.Copy(keys[0], K_stack, kInSharedMemory);
-    for (size_t k = 1; k <= i; ++k) {
-      Matrix *K_next = matrix_memory_allocator.Allocate("K_stack_next");
-      gpu_sim.Concat(K_stack, keys[k], K_next, /*axis=*/0, kInSharedMemory);
-      gpu_sim.ReleaseMatrix(K_stack);
-      K_stack = K_next;
-    }
-    // Transpose to get K^T (d x (i+1)) in SRAM
-    gpu_sim.Transpose(K_stack, kInSharedMemory);
 
-    // Build V_stack (i+1 x d) in SRAM by vertical concatenation of values[0..i]
-    Matrix *V_stack = matrix_memory_allocator.Allocate("V_stack_0");
-    gpu_sim.Copy(values[0], V_stack, kInSharedMemory);
-    for (size_t k = 1; k <= i; ++k) {
-      Matrix *V_next = matrix_memory_allocator.Allocate("V_stack_next");
-      gpu_sim.Concat(V_stack, values[k], V_next, /*axis=*/0, kInSharedMemory);
-      gpu_sim.ReleaseMatrix(V_stack);
-      V_stack = V_next;
+    // Update accumulators for K^T and V
+    if (i == 0) {
+      // Initialize K_T_acc from keys[0]
+      gpu_sim.MoveMatrixToSharedMem(keys[0]);
+      Matrix *k0_copy = matrix_memory_allocator.Allocate("k_copy_init");
+      gpu_sim.Copy(keys[0], k0_copy, kInSharedMemory);
+      gpu_sim.Transpose(k0_copy, kInSharedMemory);
+      K_T_acc = k0_copy;
+      // Initialize V_stack_acc from values[0]
+      gpu_sim.MoveMatrixToSharedMem(values[0]);
+      Matrix *v0_copy = matrix_memory_allocator.Allocate("v_copy_init");
+      gpu_sim.Copy(values[0], v0_copy, kInSharedMemory);
+      V_stack_acc = v0_copy;
+    } else {
+      // Append new key column to K_T_acc
+      gpu_sim.MoveMatrixToSharedMem(keys[i]);
+      Matrix *k_copy = matrix_memory_allocator.Allocate("k_copy");
+      gpu_sim.Copy(keys[i], k_copy, kInSharedMemory);
+      gpu_sim.Transpose(k_copy, kInSharedMemory);
+      Matrix *K_T_next = matrix_memory_allocator.Allocate("K_T_next");
+      gpu_sim.Concat(K_T_acc, k_copy, K_T_next, /*axis=*/1, kInSharedMemory);
+      gpu_sim.ReleaseMatrix(K_T_acc);
+      gpu_sim.ReleaseMatrix(k_copy);
+      K_T_acc = K_T_next;
+
+      // Append new value row to V_stack_acc
+      gpu_sim.MoveMatrixToSharedMem(values[i]);
+      Matrix *v_copy = matrix_memory_allocator.Allocate("v_copy");
+      gpu_sim.Copy(values[i], v_copy, kInSharedMemory);
+      Matrix *V_next = matrix_memory_allocator.Allocate("V_next");
+      gpu_sim.Concat(V_stack_acc, v_copy, V_next, /*axis=*/0, kInSharedMemory);
+      gpu_sim.ReleaseMatrix(V_stack_acc);
+      gpu_sim.ReleaseMatrix(v_copy);
+      V_stack_acc = V_next;
     }
 
     // logits = Q * K^T  => shape: (i+1) x (i+1) in SRAM
     Matrix *logits = matrix_memory_allocator.Allocate("logits");
-    gpu_sim.MatMul(Q, K_stack, logits);
+    gpu_sim.MatMul(Q, K_T_acc, logits);
 
     // Build answer row-by-row: for each row, softmax then multiply with V_stack
     Matrix *answer = nullptr;
@@ -59,7 +74,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
 
       // row_ans = row_soft * V_stack => shape: 1 x d
       Matrix *row_ans = matrix_memory_allocator.Allocate("row_ans");
-      gpu_sim.MatMul(row_soft, V_stack, row_ans);
+      gpu_sim.MatMul(row_soft, V_stack_acc, row_ans);
 
       // Accumulate rows into final answer matrix (vertical concat)
       if (row_idx == 0) {
@@ -83,9 +98,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     // Move final answer to HBM for committing
     gpu_sim.MoveMatrixToGpuHbm(answer);
 
-    // Release large intermediates to minimize peak memory
-    gpu_sim.ReleaseMatrix(K_stack);
-    gpu_sim.ReleaseMatrix(V_stack);
+    // Release intermediates for this round
     gpu_sim.ReleaseMatrix(logits);
 
     // Execute and commit
@@ -121,7 +134,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     gpu_sim.Run(false, &matrix_memory_allocator);
     //rater.CommitAnswer(YOUR_ANSWER_MATRIX)(Commit after running the simulator.)
     /*********************  End of your code *********************/
-  
+
     /*
      * If you want to print debug information, you can use:
      * gpu_sim.Run(true, &matrix_memory_allocator);
